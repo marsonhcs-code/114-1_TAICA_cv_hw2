@@ -18,50 +18,203 @@ from tools.utils import (
 )
 from tools.io import write_json, append_csv_row, save_ckpt, load_ckpt, load_cfg
 from tools.kfold import make_kfold_splits
-from hooks import build_model, build_dataloaders, evaluate
+from hooks_yolo_longtail import build_model, build_dataloaders, evaluate
 
 # ======================= 直接在這裡改參數 =======================
+# train.py - Modified CONFIG for Long-Tail Detection
+
 CONFIG = dict(
-    # 基本
-    cfg="configs/exp.yaml",
-    out="runs/exp1",
-    model_name="model",
-    epochs=50,
+    # ========== 基本設定 ==========
+    cfg="configs/exp_longtail.yaml",
+    out="runs/longtail_yolo_exp1",
+    model_name="yolo_longtail",
+    epochs=150,  # Long-tail 通常需要更多 epochs
     seed=42,
-    note="",
-
-    # 訓練
-    amp=True,               # 使用混合精度
-    compile=False,          # 需 PyTorch 2.x
-    accum=1,                # 梯度累積步數
-    grad_clip=None,         # 例: 1.0；None 表示不啟用
-
-    # DDP
-    dist=False,             # 用 torchrun 時設 True
+    note="YOLOv8 + CB-Focal Loss + Repeat Factor Sampling + Strong Aug for Tail",
+    
+    # ========== 訓練優化 ==========
+    amp=True,
+    compile=False,  # Set True if PyTorch 2.x
+    accum=4,  # Gradient accumulation (effective batch = 16*4 = 64)
+    grad_clip=10.0,  # Clip gradients to prevent explosion
+    
+    # ========== DDP (Multi-GPU) ==========
+    dist=False,  # Set True when using torchrun
     find_unused_parameters=False,
-
-    # 選擇最佳模型的指標名稱（需在 evaluate() 的 metrics 回傳）
-    best_metric="map5095",
-
-    # 每個 epoch 都做 test（可選）
-    eval_test_each_epoch=False,
-
-    # 斷點續訓（可選）
-    resume=None,            # 例: "runs/exp1/weights/best.pt" 或 "runs/exp1"
-
-    # Early Stopping（可選）
-    early_stop_patience=None,  # 例: 10；None 表示關閉
-
-    # Scheduler（可選）
-    scheduler="cos",        # None / "cos" / "step"
-    step_size=30,           # scheduler="step" 用
-    gamma=0.1,              # scheduler="step" 用
-
-    # K-fold（可選；>0 啟動）
-    kfold=0,
-    save_splits=False,
+    
+    # ========== 最佳模型指標 ==========
+    # Long-tail 建議用 tail classes 的平均 AP
+    best_metric="map5095",  # or "tail_map" if implemented
+    
+    # ========== 測試評估 ==========
+    eval_test_each_epoch=False,  # 節省時間，只在最後測試
+    
+    # ========== Resume Training ==========
+    resume=None,  # "runs/longtail_yolo_exp1/weights/best.pt"
+    
+    # ========== Early Stopping ==========
+    early_stop_patience=20,  # Long-tail 需要更多耐心
+    
+    # ========== Learning Rate Scheduler ==========
+    scheduler="cos",  # Cosine Annealing 適合 long-tail
+    # For step scheduler:
+    # scheduler="step"
+    # step_size=50
+    # gamma=0.1
+    
+    # ========== K-Fold Cross Validation ==========
+    kfold=0,  # 0 = disabled; 5 = 5-fold CV
+    save_splits=True,
+    
+    # ========== Long-Tail Specific ==========
+    # 以下是額外參數，會傳入 cfg
+    longtail_config=dict(
+        # Two-stage training
+        enable_two_stage=False,
+        stage1_epochs=100,
+        stage2_epochs=50,
+        
+        # Logit adjustment (test-time)
+        use_logit_adjustment=True,
+        tau=1.0,
+        
+        # Monitoring
+        monitor_tail_classes=True,
+        tail_class_ids=[1, 2, 3],  # motorcycle, person, hov
+        
+        # Visualization
+        save_confusion_matrix=True,
+        save_pr_curves=True,
+    )
 )
-# ===============================================================
+
+
+# ========== 推薦的訓練流程 ==========
+"""
+實驗 1: Baseline (no long-tail handling)
+---------------------------------------
+CONFIG = {
+    'note': 'Baseline YOLO without long-tail strategies',
+    'cfg': 'configs/exp_baseline.yaml',  # use_cb_loss=False, use_repeat_factor_sampling=False
+    'out': 'runs/exp1_baseline',
+    'epochs': 100,
+}
+
+預期結果：
+- Overall mAP: ~65%
+- Car AP: ~80% (good)
+- HOV AP: ~25% (poor) ← 這是我們要改善的
+
+
+實驗 2: CB-Focal Loss
+----------------------
+CONFIG = {
+    'note': 'Add Class-Balanced Focal Loss',
+    'cfg': 'configs/exp_cb_loss.yaml',  # use_cb_loss=True
+    'out': 'runs/exp2_cb_loss',
+    'epochs': 100,
+}
+
+預期改善：
+- HOV AP: 25% → 35% (+10%)
+- Overall mAP: 65% → 67% (+2%)
+
+
+實驗 3: CB-Focal + Repeat Factor Sampling
+------------------------------------------
+CONFIG = {
+    'note': 'CB Loss + Repeat Factor Sampling',
+    'cfg': 'configs/exp_cb_rfs.yaml',  # use_repeat_factor_sampling=True
+    'out': 'runs/exp3_cb_rfs',
+    'epochs': 120,  # RFS 需要更多 epochs
+}
+
+預期改善：
+- HOV AP: 35% → 45% (+10%)
+- Overall mAP: 67% → 70% (+3%)
+
+
+實驗 4: Full Pipeline (CB + RFS + Strong Aug)
+----------------------------------------------
+CONFIG = {
+    'note': 'Full long-tail pipeline',
+    'cfg': 'configs/exp_longtail.yaml',  # All strategies enabled
+    'out': 'runs/exp4_full',
+    'epochs': 150,
+    'accum': 4,
+}
+
+預期改善：
+- HOV AP: 45% → 55% (+10%)
+- Overall mAP: 70% → 73% (+3%)
+
+
+實驗 5: Two-Stage Training (Optional)
+--------------------------------------
+CONFIG = {
+    'note': 'Two-stage: pretrain → tail fine-tune',
+    'cfg': 'configs/exp_two_stage.yaml',
+    'out': 'runs/exp5_two_stage',
+    'epochs': 150,  # 100 stage1 + 50 stage2
+    'longtail_config': {
+        'enable_two_stage': True,
+        'stage1_epochs': 100,
+        'stage2_epochs': 50,
+    }
+}
+
+預期改善：
+- HOV AP: 55% → 60% (+5%)
+- Overall mAP: 73% → 74% (+1%)
+"""
+
+
+# ========== 執行命令範例 ==========
+"""
+# Single GPU
+nohup python train.py > log/run_exp4_full.log 2>&1 & echo $! > log/run_exp4.pid
+
+# Multi-GPU (2 cards)
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 --standalone train.py > log/run_exp4_full.log 2>&1 & echo $! > log/run_exp4.pid
+
+# Check training progress
+tail -f log/run_exp4_full.log
+
+# Monitor GPU usage
+watch -n 1 nvidia-smi
+
+# Kill training
+kill $(cat log/run_exp4.pid) && rm log/run_exp4.pid
+"""
+
+
+# ========== Important Notes ==========
+"""
+1. Batch Size 調整：
+   - 單 GPU (24GB): batch=16, accum=4 → effective_batch=64
+   - 雙 GPU (24GB): batch=16, accum=2 → effective_batch=64
+   - 若 OOM: 降低 batch 並增加 accum 保持 effective_batch
+
+2. Learning Rate 調整：
+   - effective_batch=64 → lr=0.001
+   - effective_batch=128 → lr=0.002
+   - Linear scaling rule
+
+3. Epochs 調整：
+   - Baseline: 100 epochs
+   - With RFS: 120-150 epochs (因為每個 epoch 看到更多樣本)
+   - Two-stage: 100 + 50 epochs
+
+4. 監控指標：
+   - 不要只看 overall mAP！
+   - 重點看 tail classes (hov, person, motorcycle) 的 AP
+   - 使用 per_class_metrics.csv 追蹤每個類別
+
+5. 調試技巧：
+   - 先用小資料集 (100 images) 快速驗證 pipeline
+   - 確認 loss 有正常下降
+   - 檢查 confusion matrix 找出混淆的類別
+"""
 
 
 def train_one_epoch(model, loader, optimizer, device, scaler=None,
