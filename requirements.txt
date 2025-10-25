@@ -1,0 +1,10 @@
+# torch
+# torchvision
+ultralytics
+opencv-python
+pycocotools
+torchmetrics
+pyyaml
+pandas
+matplotlib
+seaborn

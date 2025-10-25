@@ -18,94 +18,56 @@ from tools.utils import (
 )
 from tools.io import write_json, append_csv_row, save_ckpt, load_ckpt, load_cfg
 from tools.kfold import make_kfold_splits
-from hooks_yolo_longtail import build_model, build_dataloaders, evaluate
+from hooks import build_model, build_dataloaders, evaluate
 
 # ======================= 直接在這裡改參數 =======================
-# train.py - Modified CONFIG for Long-Tail Detection
-
-CONFIG = dict(
-    # ========== 基本設定 ==========
-    cfg="configs/exp_longtail.yaml",
-    out="runs/longtail_yolo_exp1",
-    model_name="yolo_longtail",
-    epochs=150,  # Long-tail 通常需要更多 epochs
-    seed=42,
-    note="YOLOv8 + CB-Focal Loss + Repeat Factor Sampling + Strong Aug for Tail",
-    
-    # ========== 訓練優化 ==========
-    amp=True,
-    compile=False,  # Set True if PyTorch 2.x
-    accum=4,  # Gradient accumulation (effective batch = 16*4 = 64)
-    grad_clip=10.0,  # Clip gradients to prevent explosion
-    
-    # ========== DDP (Multi-GPU) ==========
-    dist=False,  # Set True when using torchrun
-    find_unused_parameters=False,
-    
-    # ========== 最佳模型指標 ==========
-    # Long-tail 建議用 tail classes 的平均 AP
-    best_metric="map5095",  # or "tail_map" if implemented
-    
-    # ========== 測試評估 ==========
-    eval_test_each_epoch=False,  # 節省時間，只在最後測試
-    
-    # ========== Resume Training ==========
-    resume=None,  # "runs/longtail_yolo_exp1/weights/best.pt"
-    
-    # ========== Early Stopping ==========
-    early_stop_patience=20,  # Long-tail 需要更多耐心
-    
-    # ========== Learning Rate Scheduler ==========
-    scheduler="cos",  # Cosine Annealing 適合 long-tail
-    # For step scheduler:
-    # scheduler="step"
-    # step_size=50
-    # gamma=0.1
-    
-    # ========== K-Fold Cross Validation ==========
-    kfold=0,  # 0 = disabled; 5 = 5-fold CV
-    save_splits=True,
-    
-    # ========== Long-Tail Specific ==========
-    # 以下是額外參數，會傳入 cfg
-    longtail_config=dict(
-        # Two-stage training
-        enable_two_stage=False,
-        stage1_epochs=100,
-        stage2_epochs=50,
-        
-        # Logit adjustment (test-time)
-        use_logit_adjustment=True,
-        tau=1.0,
-        
-        # Monitoring
-        monitor_tail_classes=True,
-        tail_class_ids=[1, 2, 3],  # motorcycle, person, hov
-        
-        # Visualization
-        save_confusion_matrix=True,
-        save_pr_curves=True,
-    )
-)
-
-
-# ========== 推薦的訓練流程 ==========
+# train.py - CONFIG 設定
 """
 實驗 1: Baseline (no long-tail handling)
----------------------------------------
-CONFIG = {
-    'note': 'Baseline YOLO without long-tail strategies',
-    'cfg': 'configs/exp_baseline.yaml',  # use_cb_loss=False, use_repeat_factor_sampling=False
-    'out': 'runs/exp1_baseline',
-    'epochs': 100,
-}
-
+--------
 預期結果：
 - Overall mAP: ~65%
 - Car AP: ~80% (good)
 - HOV AP: ~25% (poor) ← 這是我們要改善的
+"""
+CONFIG = dict(
+    # 基本
+    cfg="configs/exp_baseline.yaml",  # <-- 指向 baseline config
+    out="runs/exp1_baseline",
+    model_name="yolo_baseline", # 這是 log 用的
+    epochs=100, 
+    seed=42,
+    note="Baseline: YOLOv8n from scratch without long-tail handling", #
 
+    # 訓練
+    amp=True,
+    compile=False,
+    accum=4,  
+    grad_clip=10.0,
 
+    # DDP
+    dist=False,
+    find_unused_parameters=False,
+
+    # 評估
+    best_metric="map5095", #
+    eval_test_each_epoch=False,
+
+    # Resume
+    resume=None,
+
+    # Early Stopping
+    early_stop_patience=20,
+
+    # Scheduler
+    scheduler="cos",
+
+    # K-Fold
+    kfold=0, # 0 = 不使用 k-fold
+    save_splits=False,
+)
+# ========== 推薦的訓練流程 ==========
+"""
 實驗 2: CB-Focal Loss
 ----------------------
 CONFIG = {

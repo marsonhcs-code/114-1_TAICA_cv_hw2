@@ -3,7 +3,7 @@
 
 # ==================== Task & Model ====================
 task: "detection"
-model_name: "yolov8n.pt"  # or yolov8s/m/l/x, yolov9
+model_name: "yolov12l.pt"  # or yolov8s/m/l/x, yolov9
 num_classes: 4
 class_names: ["car", "motorcycle", "person", "hov"]
 
@@ -143,7 +143,7 @@ vis_samples: 20
 # 實驗說明（會被記錄到 hparams.json）
 experiment_notes: |
   Long-Tailed Object Detection for Drone-based Traffic Counting
-  - Using YOLOv8 with Class-Balanced Focal Loss
+  - Using YOLOv12 with Class-Balanced Focal Loss
   - Repeat Factor Sampling for tail classes
   - Strong augmentation for hov/person/motorcycle
   - Target: Improve AP on tail classes while maintaining overall mAP
