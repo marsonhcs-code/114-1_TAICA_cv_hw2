@@ -16,7 +16,7 @@ val_ratio: 0.2   # 假設 20% 驗證
 test_ratio: 0.0
 
 # Model
-model_name: "yolov8n.yaml"  # <--- 修改點：明確指定 .yaml (from scratch)
+model_name: "yolov8m.yaml"  # <--- 修改點：明確指定 .yaml (from scratch)
 num_classes: 4
 class_names: ["car", "motorcycle", "person", "hov"]
 

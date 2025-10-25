@@ -15,6 +15,7 @@
 - 單 GPU
     `nohup python train.py > log/run_model1.log 2>&1 & echo $! > log/run1.pid &`
 - 多 GPU (以 0,1 兩張卡為例)
+    `nohup python -m torch.distributed.run --nproc_per_node=2 train.py > log/run_exp1_baseline_ddp.log 2>&1 & echo $! > log/run_exp1_ddp.pid &`
     `CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 --standalone train.py > log/run_model2.log 2>&1 & echo $! > log/run2.pid &`
 
 ## 檢查還在不在跑：

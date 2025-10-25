@@ -8,3 +8,4 @@ pyyaml
 pandas
 matplotlib
 seaborn
+kaggle
