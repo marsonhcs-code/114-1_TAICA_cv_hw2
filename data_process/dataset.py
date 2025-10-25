@@ -1,32 +1,28 @@
 # data_process/dataset.py
+# (重寫以支援 YOLO .txt 格式)
+
 import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
-import json
 from collections import defaultdict
-
-# 為了未來的 Milestone 4 (Augmentation) 先 import
-# import albumentations as A
-# from albumentations.pytorch import ToTensorV2
 
 class DroneTrafficDataset(Dataset):
     """
-    讀取 COCO format 的無人機交通數據集
+    讀取 YOLO 格式的無人機交通數據集
+    (每張 .png/.jpg 圖片對應一個 .txt 標註檔)
     
     支援功能：
-    - COCO format 讀取
+    - YOLO format 讀取 (class,x_c,y_c,w,h) (像素座標, 逗號分隔)
     - Resize & Letterbox padding
     - Class Frequencies 計算 (for RFS)
-    - (Future) Class-aware augmentation
     """
     
     def __init__(self,
-                 annotation_file: str,
                  image_dir: str,
-                 image_ids: List[str],
+                 image_ids: List[str], # <-- 這將是圖片檔名列表 (e.g., ["img0001.png", ...])
                  imgsz: int = 640,
                  augment: bool = False,
                  class_names: Optional[List[str]] = None,
@@ -39,58 +35,38 @@ class DroneTrafficDataset(Dataset):
         self.image_dir = Path(image_dir)
         self.imgsz = imgsz
         self.augment = augment
-        self.image_ids = image_ids # 只載入傳入的 IDs
         
         self.strong_aug_for_tail = strong_aug_for_tail
         self.tail_class_ids = set(tail_class_ids)
         self.aug_cfg = augmentation_config
         
-        # --- 載入 Annotations ---
-        print(f"Loading annotations from {annotation_file}...")
-        with open(annotation_file, 'r') as f:
-            data = json.load(f)
-        
-        self.annotations = {} # {image_id: [list of anns]}
+        self.class_names = class_names if class_names else []
         self.class_counts = defaultdict(int)
-        img_id_map = {} # {coco_img_id: file_name}
-
-        # 處理 COCO 格式
-        if 'images' in data and 'annotations' in data:
-            for img in data['images']:
-                img_id_map[img['id']] = img['file_name']
-            
-            for ann in data['annotations']:
-                img_file_name = img_id_map.get(ann['image_id'])
-                if img_file_name not in self.annotations:
-                    self.annotations[img_file_name] = []
-                
-                self.annotations[img_file_name].append({
-                    'bbox': ann['bbox'],  # [x_min, y_min, w, h]
-                    'category_id': ann['category_id']
-                })
         
-        # 處理 {image_id: [anns]} 格式
-        else:
-            self.annotations = data
-
-        # --- 建立 Samples & 計算 Class Frequencies ---
         self.samples = [] # [ (img_id, img_path, list_of_anns), ... ]
         self.image_class_map = {} # {idx: set(class_ids)}
         
-        for idx, img_id in enumerate(self.image_ids):
-            if img_id not in self.annotations:
-                # print(f"Warning: Image ID {img_id} not found in annotations. Skipping.")
+        print(f"Loading YOLO-style data from: {self.image_dir}")
+        
+        for idx, img_id in enumerate(image_ids):
+            img_path = self.image_dir / img_id
+            # 標註檔的路徑 (e.g., img0001.png -> img0001.txt)
+            label_path = img_path.with_suffix('.txt')
+
+            if not img_path.exists():
+                print(f"Warning: Image file not found {img_path}. Skipping.")
                 continue
-                
-            img_path = self.find_image_path(img_id)
-            if img_path is None:
-                # print(f"Warning: Image file for {img_id} not found in {self.image_dir}. Skipping.")
+            if not label_path.exists():
+                print(f"Warning: Label file not found {label_path}. Skipping.")
                 continue
 
-            anns = self.annotations[img_id]
+            # --- 載入標註 ---
+            # anns = [ {'bbox': [x1,y1,x2,y2], 'category_id': id}, ... ]
+            anns = self.parse_yolo_txt(label_path)
+            
             self.samples.append((img_id, img_path, anns))
             
-            # 計算 Frequencies (僅限 training set)
+            # --- 計算 Class Frequencies (for RFS) ---
             classes_in_image = set()
             if self.augment: # 假設 augment=True 代表是 training set
                 for ann in anns:
@@ -100,30 +76,46 @@ class DroneTrafficDataset(Dataset):
             self.image_class_map[idx] = classes_in_image
 
         if self.augment:
-             print(f"Training set class counts: {dict(self.class_counts)}")
+             print(f"Training set class counts (from .txt files): {dict(self.class_counts)}")
         
-        # --- Class Names ---
-        if class_names:
-            self.class_names = class_names
-        elif 'categories' in data:
-            self.class_names = [cat['name'] for cat in sorted(data['categories'], key=lambda x: x['id'])]
-        else:
-            self.class_names = [str(i) for i in range(max(self.class_counts.keys()) + 1)]
-        
+        if not self.class_names and self.class_counts:
+             self.class_names = [str(i) for i in range(max(self.class_counts.keys()) + 1)]
         self.num_classes = len(self.class_names)
-        
-    def find_image_path(self, img_id: str) -> Optional[Path]:
-        """ 尋找圖片路徑，自動嘗試 .jpg, .png, .jpeg """
-        img_path = self.image_dir / img_id
-        if img_path.exists():
-            return img_path
-        
-        stem = Path(img_id).stem
-        for ext in ['.jpg', '.png', '.jpeg']:
-            img_path = self.image_dir / f"{stem}{ext}"
-            if img_path.exists():
-                return img_path
-        return None
+
+    def parse_yolo_txt(self, label_path: Path) -> List[Dict]:
+        """
+        解析您的 .txt 檔案: "class_id,x_center,y_center,width,height"  (像素)
+        並轉換為 [x_min, y_min, x_max, y_max] (像素)
+        """
+        annotations = []
+        try:
+            with open(label_path, 'r') as f:
+                for line in f.readlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    parts = line.split(',')
+                    if len(parts) != 5:
+                        print(f"Warning: Skipping malformed line in {label_path}: {line}")
+                        continue
+                        
+                    cls_id, x_c, y_c, w, h = map(float, parts)
+                    
+                    # 轉換 (xc, yc, w, h) -> (x1, y1, x2, y2)
+                    x1 = x_c - w / 2
+                    y1 = y_c - h / 2
+                    x2 = x_c + w / 2
+                    y2 = y_c + h / 2
+                    
+                    annotations.append({
+                        'bbox': [x1, y1, x2, y2], # 格式：xyxy (像素)
+                        'category_id': int(cls_id)
+                    })
+        except Exception as e:
+            print(f"Error reading {label_path}: {e}")
+            
+        return annotations
 
     def __len__(self):
         return len(self.samples)
@@ -153,7 +145,6 @@ class DroneTrafficDataset(Dataset):
             w1, h1 = int(w0 * r), int(h0 * r)
             img = cv2.resize(img, (w1, h1), interpolation=interp)
         
-        # 計算 padding
         h1, w1 = img.shape[:2]
         pad_h = (self.imgsz - h1) // 2
         pad_w = (self.imgsz - w1) // 2
@@ -165,16 +156,9 @@ class DroneTrafficDataset(Dataset):
         boxes = []
         labels = []
         for ann in anns:
-            x, y, w, h = ann['bbox'] # COCO [x, y, w, h]
+            # 'bbox' 已經是 [x1, y1, x2, y2] (像素) 格式
+            box = np.array(ann['bbox'])
             cls_id = ann['category_id']
-            
-            # 轉換為 [x_min, y_min, x_max, y_max]
-            x1 = x
-            y1 = y
-            x2 = x + w
-            y2 = y + h
-            
-            box = np.array([x1, y1, x2, y2])
             
             # 依據 resize 和 padding 調整座標
             box = box * r
@@ -185,7 +169,6 @@ class DroneTrafficDataset(Dataset):
             box[[0, 2]] = box[[0, 2]].clip(0, self.imgsz)
             box[[1, 3]] = box[[1, 3]].clip(0, self.imgsz)
             
-            # 忽略無效的 box
             if (box[2] <= box[0]) or (box[3] <= box[1]):
                 continue
                 
@@ -193,9 +176,7 @@ class DroneTrafficDataset(Dataset):
             labels.append(cls_id)
 
         # --- 4. Augmentation (Milestone 1: 簡易) ---
-        # TODO (Milestone 4): 換成 Albumentations
         if self.augment:
-            # 簡易左右翻轉
             if np.random.rand() < 0.5:
                 img_padded = cv2.flip(img_padded, 1)
                 if len(boxes) > 0:
@@ -207,15 +188,14 @@ class DroneTrafficDataset(Dataset):
                     boxes = boxes_np.tolist()
 
         # --- 5. 轉換為 Tensors ---
-        # (H, W, C) -> (C, H, W)
         img_tensor = torch.from_numpy(img_padded).permute(2, 0, 1).float() / 255.0
         
         boxes_tensor = torch.tensor(boxes, dtype=torch.float32) if boxes else torch.zeros((0, 4))
         labels_tensor = torch.tensor(labels, dtype=torch.long) if labels else torch.zeros((0,), dtype=torch.long)
         
         target = {
-            'boxes': boxes_tensor,  # [N, 4] (xyxy)
-            'labels': labels_tensor, # [N]
+            'boxes': boxes_tensor,
+            'labels': labels_tensor,
             'image_id': img_id,
             'orig_size': torch.tensor([h0, w0]),
             'pad_info': torch.tensor([pad_w, pad_h, r])

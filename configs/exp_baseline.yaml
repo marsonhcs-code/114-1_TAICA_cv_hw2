@@ -3,8 +3,8 @@
 task: "detection"
 
 # Data
-annotation_file: "data/annotations.json"
-image_dir: "data/images"
+image_dir: "data/CVPDL_hw2/train"
+test_image_dir: "data/CVPDL_hw2/test"
 imgsz: 640
 batch: 10
 workers: 8

@@ -17,19 +17,18 @@ from data_process.dataset import DroneTrafficDataset
 from data_process.sampler import RepeatFactorSampler, DistributedRepeatFactorSampler
 from models.yolo_detector import YOLODetector
 from tools.utils import get_rank, is_distributed
+from pathlib import Path # 確保
+import os # 確保
+import numpy as np # 確保
+from data_process.dataset import DroneTrafficDataset # 確保
 
-# ==================== Build Functions ====================
 
 def detection_collate_fn(batch):
     """
-    偵測任務的 Collate Function
-    - images: list of [C, H, W] Tensors
-    - targets: list of dictionaries
+    (保持不變)
     """
     images, targets = zip(*batch)
-    # 在 YOLODetector 中，我們會將 images stack 起來
     return list(images), list(targets)
-
 
 def build_model(cfg: Dict[str, Any]) -> nn.Module:
     """
@@ -64,11 +63,7 @@ def build_dataloaders(cfg: Dict[str, Any],
                       dist: bool = False) -> Dict[str, Any]:
     """
     建立 Dataloaders
-    支援：
-    1. K-Fold (via fold_split)
-    2. 比例切分 (train_ratio / val_ratio)
-    3. 檔案切分 (train_ids_file / val_ids_file)
-    4. RFS (Repeat Factor Sampling)
+    (修改：不再讀取 annotation_file，而是掃描 image_dir)
     """
     
     batch_size = int(cfg.get("batch", 16))
@@ -78,6 +73,11 @@ def build_dataloaders(cfg: Dict[str, Any],
     train_ids = []
     val_ids = []
     all_ids = [] # 用於 k-fold 或 ratio split
+    
+    # 獲取 image_dir (e.g., "data/CVPDL_hw2/train")
+    image_dir = Path(cfg['image_dir'])
+    if not image_dir.exists():
+        raise FileNotFoundError(f"Image directory not found: {image_dir}")
 
     # 優先 1: K-Fold
     if fold_split is not None:
@@ -95,15 +95,15 @@ def build_dataloaders(cfg: Dict[str, Any],
         
     # 優先 3: 比例切分 (預設)
     else:
-        print(f"[Data] Using split_method: 'ratio'")
-        # 載入所有 IDs
-        with open(cfg['annotation_file'], 'r') as f:
-            data = json.load(f)
-            # 支援 COCO 'images' 或 {image_id: ...} 格式
-            if 'images' in data:
-                all_ids = [img['file_name'] for img in data['images']]
-            else:
-                all_ids = list(data.keys())
+        # 【修改點】
+        print(f"[Data] Using split_method: 'ratio'. Scanning {image_dir} for images...")
+        # 掃描 image_dir 找出所有圖片 (e.g., img0001.png, img0002.png)
+        all_ids = []
+        for ext in ['.png', '.jpg', '.jpeg', '.bmp', '.webp']:
+             all_ids.extend([p.name for p in image_dir.glob(f'*{ext}')])
+        
+        if not all_ids:
+            raise FileNotFoundError(f"No images found in {image_dir}")
         
         # 打亂
         np.random.seed(cfg.get("seed", 42))
@@ -112,6 +112,10 @@ def build_dataloaders(cfg: Dict[str, Any],
         train_r = cfg.get("train_ratio", 0.8)
         val_r = cfg.get("val_ratio", 0.2)
         
+        if (train_r + val_r) > 1.0:
+            print(f"Warning: train_ratio ({train_r}) + val_ratio ({val_r}) > 1.0. Adjusting val_ratio.")
+            val_r = 1.0 - train_r
+            
         train_idx = int(len(all_ids) * train_r)
         val_idx = int(len(all_ids) * (train_r + val_r))
         
@@ -119,53 +123,53 @@ def build_dataloaders(cfg: Dict[str, Any],
         val_ids = all_ids[train_idx:val_idx]
         # test_ids = all_ids[val_idx:] # 剩下的當作 test
         
+    print(f"[Data] Total images scanned: {len(all_ids)}")
     print(f"[Data] Train images: {len(train_ids)}, Val images: {len(val_ids)}")
     
     # --- 2. 建立 Datasets ---
+    # 【修改點】: 不再傳入 annotation_file
     ds_train = DroneTrafficDataset(
-        annotation_file=cfg['annotation_file'],
         image_dir=cfg['image_dir'],
         image_ids=train_ids,
         imgsz=cfg.get('imgsz', 640),
         augment=True,
         class_names=cfg.get('class_names'),
-        # Augmentation 相關 (Milestone 4+)
         strong_aug_for_tail=cfg.get('strong_aug_for_tail', False),
         tail_class_ids=cfg.get('tail_class_ids', []),
         augmentation_config=cfg.get('augmentation', {})
     )
     
     ds_val = DroneTrafficDataset(
-        annotation_file=cfg['annotation_file'],
         image_dir=cfg['image_dir'],
         image_ids=val_ids,
         imgsz=cfg.get('imgsz', 640),
-        augment=False, # 驗證集不需增強
+        augment=False,
         class_names=cfg.get('class_names')
     )
     
-    # (可選) 建立 Test Dataset (如果 user config 有提供)
+    # (可選) 建立 Test Dataset (for predict.py)
     ds_test = None
-    test_ids = cfg.get("test_ids_file") # 假設 test set 總是來自檔案
-    if test_ids and Path(test_ids).exists():
-        test_ids_list = Path(test_ids).read_text().splitlines()
+    test_image_dir = cfg.get("test_image_dir") # e.g., "data/CVPDL_hw2/test"
+    if test_image_dir and Path(test_image_dir).exists():
+        test_ids_list = []
+        for ext in ['.png', '.jpg', '.jpeg', '.bmp', '.webp']:
+            test_ids_list.extend([p.name for p in Path(test_image_dir).glob(f'*{ext}')])
+            
         ds_test = DroneTrafficDataset(
-            annotation_file=cfg['annotation_file'],
-            image_dir=cfg['image_dir'],
+            image_dir=test_image_dir,
             image_ids=test_ids_list,
             imgsz=cfg.get('imgsz', 640),
             augment=False,
             class_names=cfg.get('class_names')
         )
         print(f"[Data] Test images: {len(test_ids_list)}")
-
     
     # --- 3. 建立 Samplers (Milestone 1 vs 3) ---
+    # ( ... 這部分保持不變 ...)
     sampler_train = None
     sampler_val = None
     sampler_test = None
     
-    # 檢查是否啟用 RFS (Milestone 3+)
     use_rfs = cfg.get('use_repeat_factor_sampling', False)
     
     if dist:
@@ -185,18 +189,17 @@ def build_dataloaders(cfg: Dict[str, Any],
         sampler_test = DistributedSampler(ds_test, shuffle=False) if ds_test else None
         
     elif use_rfs:
-        # Single GPU + RFS
-        print("[Sampler] Using RepeatFactorSampler")
         sampler_train = RepeatFactorSampler(
             ds_train, 
             repeat_thresh=cfg.get('repeat_thresh', 0.001)
         )
     
     # --- 4. 建立 Dataloaders ---
+    # ( ... 這部分保持不變 ...)
     dl_train = DataLoader(
         ds_train,
         batch_size=batch_size,
-        shuffle=(sampler_train is None), # 有 sampler 時 shuffle 必須為 None
+        shuffle=(sampler_train is None),
         sampler=sampler_train,
         num_workers=num_workers,
         pin_memory=True,
@@ -206,7 +209,7 @@ def build_dataloaders(cfg: Dict[str, Any],
     
     dl_val = DataLoader(
         ds_val,
-        batch_size=batch_size * 2, # 驗證時 batch size 可開大一點
+        batch_size=batch_size * 2,
         shuffle=False,
         sampler=sampler_val,
         num_workers=num_workers,
@@ -228,7 +231,6 @@ def build_dataloaders(cfg: Dict[str, Any],
             drop_last=False
         )
     
-    # 回傳 k-fold/ratio split 需要的 all_ids
     meta = {
         "all_ids": all_ids,
         "train_ids": train_ids,
@@ -236,7 +238,6 @@ def build_dataloaders(cfg: Dict[str, Any],
     }
     
     return {"train": dl_train, "val": dl_val, "test": dl_test, "meta": meta}
-
 
 # ==================== Evaluation ====================
 @torch.no_grad()
