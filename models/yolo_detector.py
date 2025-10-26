@@ -2,6 +2,7 @@
 import torch
 import torch.nn as nn
 from typing import List, Dict, Optional, Any
+from types import SimpleNamespace
 
 try:
     from ultralytics.nn.tasks import DetectionModel
@@ -25,6 +26,7 @@ class YOLODetector(nn.Module):
     def __init__(self, 
                  model_name: str = "yolov8n.yaml",
                  num_classes: int = 4,
+                 loss_hpy: Dict[str, Any] = {},
                  # Loss 參數
                  use_cb_loss: bool = False,
                  samples_per_cls: Optional[List[int]] = None,
@@ -39,6 +41,7 @@ class YOLODetector(nn.Module):
                  ):
         super().__init__()
         
+        
         # --- 1. 載入模型架構 (From Scratch) ---
         # DetectionModel 是 ultralytics 中的實際 nn.Module
         self.model = DetectionModel(cfg=model_name, nc=num_classes)
@@ -46,6 +49,19 @@ class YOLODetector(nn.Module):
         self.stride = self.model.stride
         self.num_classes = num_classes
         
+        h = SimpleNamespace()
+        h.box = loss_hpy.get('box', 7.5)  # box loss gain
+        h.cls = loss_hpy.get('cls', 0.5)  # cls loss gain
+        h.dfl = loss_hpy.get('dfl', 1.5)  # dfl loss gain
+        h.iou_type = loss_hpy.get('iou_type', 'ciou') # IoU 類型
+        
+        # (這些是 v8 內部預設值，不太會動，保持原樣)
+        h.box_bce_pos_weight = 1.0
+        h.dfl_bce_pos_weight = 1.0
+        
+        # 將這個 "args" 附加到 self.model 上
+        self.model.args = h
+
         # --- 2. 建立 Loss Function ---
         self.loss_fn = YOLOLongTailLoss(
             model=self.model, # Loss 需要 model (anchors, stride)
@@ -95,92 +111,189 @@ class YOLODetector(nn.Module):
                       targets: List[Dict]) -> Dict[str, torch.Tensor]:
         """
         訓練模式：回傳 loss dict
-        """
-        # --- 1. 準備 Targets 格式 (for ultralytics loss) ---
-        # (x, y, w, h) normalized
-        h, w = batch_imgs.shape[2:]
-        batch_idx_boxes_labels = []
-        for i, target in enumerate(targets):
-            boxes_xyxy = target['boxes']
-            labels = target['labels']
-            
-            if len(boxes_xyxy) == 0:
-                continue
-            
-            # 轉換 xyxy (pixel) -> xywh (normalized)
-            boxes_xywh_norm = ops.xyxy2xywhn(boxes_xyxy, w=w, h=h)
-            
-            # 建立 [batch_idx, class, x_c, y_c, w_n, h_n]
-            batch_idx_col = torch.full((len(labels), 1), i, 
-                                       device=labels.device, dtype=labels.dtype)
-            
-            # [N, 6]
-            target_tensor = torch.cat([
-                batch_idx_col,
-                labels.unsqueeze(1),
-                boxes_xywh_norm
-            ], dim=1)
-            
-            batch_idx_boxes_labels.append(target_tensor)
-        
-        targets_tensor = torch.cat(batch_idx_boxes_labels, dim=0)
-        
-        # --- 2. 模型 Forward (取得 raw feature maps) ---
-        # preds: Tuple[torch.Tensor, ...]
-        preds = self.model(batch_imgs)
-        
-        # --- 3. 計算 Loss ---
-        loss_dict = self.loss_fn(preds, targets_tensor)
-        
-        # train_one_epoch 需要 'loss' 
-        return loss_dict
-
-    def forward_eval(self, batch_imgs: torch.Tensor) -> List[List[Dict]]:
-        """
-        驗證/測試模式：回傳 NMS 後的預測結果
-        
-        回傳: List[List[Dict]]
-        - [Batch_size, Num_Heads, Dict]
-        - Dict: {'boxes': [N, 4], 'scores': [N], 'labels': [N]}
+        (【!!! 重寫此函數 !!!】)
         """
         
         # --- 1. 模型 Forward (取得 raw feature maps) ---
         preds = self.model(batch_imgs)
         
-        # --- 2. 將 Preds 解碼並執行 NMS ---
-        # self.loss_fn.decode_and_nms 會處理
-        # 它內部會呼叫 self.loss_fn.pre_process (decode)
-        # 和 ops.non_max_suppression (NMS)
-        
-        # (Milestone TBD) Logit Adjustment
-        if self.use_logit_adjustment:
-            preds = self.apply_logit_adjustment(preds)
+        # --- 2. 準備 Targets 格式 (for v8DetectionLoss) ---
+        h, w = batch_imgs.shape[2:]
+        device = batch_imgs.device
 
-        results = self.loss_fn.decode_and_nms(
-            preds,
-            conf_thres=self.conf_threshold,
-            iou_thres=self.nms_iou
-        )
-        
-        # --- 3. 格式化輸出 (for evaluate hook) ---
-        # results: [B, N, 6] (x1, y1, x2, y2, conf, cls)
-        
-        batch_outputs = []
-        for res in results:
-            boxes = res[:, :4]
-            scores = res[:, 4]
-            labels = res[:, 5].long()
+        batch_bboxes_list = []
+        batch_cls_list = []
+        batch_idx_list = []
+
+        for i, target in enumerate(targets):
+            boxes_xyxy = target['boxes'].to(device)
+            labels = target['labels'].to(device)
             
-            # 每個 head 一個 dict (雖然 v8 只有一個 head)
-            head_output = {
-                'boxes': boxes,  # xyxy
-                'scores': scores,
-                'labels': labels
+            if len(boxes_xyxy) == 0:
+                continue
+                
+            # 轉換 xyxy (pixel) -> xywh (normalized)
+            boxes_xywh_norm = ops.xyxy2xywhn(boxes_xyxy, w=w, h=h)
+            
+            # 建立 batch_idx tensor
+            batch_idx_tensor = torch.full((len(labels),), i, device=device, dtype=labels.dtype)
+            
+            batch_bboxes_list.append(boxes_xywh_norm.to(device))  # ✅ 強制放 GPU
+            batch_cls_list.append(labels)
+            batch_idx_list.append(batch_idx_tensor)
+
+        # 處理 batch 中沒有任何標註的情況
+        if not batch_idx_list:
+            loss_batch = {
+                'bboxes': torch.empty(0, 4, device=device),
+                'cls': torch.empty(0, device=device, dtype=torch.long),
+                'batch_idx': torch.empty(0, device=device, dtype=torch.long),
+                'imgsz': torch.tensor([h, w], device=device)
             }
-            batch_outputs.append([head_output]) # 包一層 list
-            
+        else:
+            loss_batch = {
+                'bboxes': torch.cat(batch_bboxes_list, dim=0).to(device),  # ✅
+                'cls': torch.cat(batch_cls_list, dim=0).to(device),        # ✅
+                'batch_idx': torch.cat(batch_idx_list, dim=0).to(device),  # ✅
+                'imgsz': torch.tensor([h, w], device=device)
+            }
+        print(f"[DEBUG] loss_batch device: bboxes={loss_batch['bboxes'].device}, imgsz={loss_batch['imgsz'].device}")
+
+        # models/yolo_detector.py (forward_train 函數結尾)
+
+        # models/yolo_detector.py (forward_train 函數結尾)
+
+        # --- 3. 計算 loss ---
+        loss_out = self.loss_fn(preds, loss_batch)
+
+        # 統一回傳 dict，至少有 key "loss"
+        result = {}
+
+        # Case A: loss_out 是已經加總好的單一 tensor
+        if torch.is_tensor(loss_out):
+            result["loss"] = loss_out
+
+        # Case B: loss_out 是 tuple 或 list
+        elif isinstance(loss_out, (tuple, list)):
+            if len(loss_out) == 2:
+                # 典型 Ultralytics 形式: (total_loss, loss_items)
+                total_loss, loss_items = loss_out
+                # 確保 total_loss 是 Tensor
+                if not torch.is_tensor(total_loss):
+                     raise RuntimeError(f"Expected total_loss to be a tensor, but got {type(total_loss)} in loss_out tuple")
+                result["loss"] = total_loss
+
+                # 嘗試拆分 loss_items 做 logging
+                if isinstance(loss_items, (list, tuple)):
+                    if len(loss_items) > 0: result["loss_box"] = loss_items[0]
+                    if len(loss_items) > 1: result["loss_cls"] = loss_items[1]
+                    if len(loss_items) > 2: result["loss_dfl"] = loss_items[2]
+                elif torch.is_tensor(loss_items):
+                    result["loss_items"] = loss_items # 純記錄用
+
+            elif len(loss_out) == 3:
+                # 自訂/簡化版: (lbox, lcls, ldfl)
+                lbox, lcls, ldfl = loss_out
+                if not all(torch.is_tensor(t) for t in loss_out):
+                     raise RuntimeError(f"Expected 3 tensors in loss_out tuple, but got types {[type(t) for t in loss_out]}")
+                total_loss = lbox + lcls + ldfl
+                result["loss"] = total_loss
+                result["loss_box"] = lbox
+                result["loss_cls"] = lcls
+                result["loss_dfl"] = ldfl
+
+            else:
+                # 不認得的 tuple/list 形狀 -> 盡量拿第一個當主 loss
+                main_loss = loss_out[0]
+                if not torch.is_tensor(main_loss):
+                    raise RuntimeError(
+                        f"loss_fn returned {type(loss_out).__name__}(len={len(loss_out)}) "
+                        f"but first element is {type(main_loss)}, not Tensor"
+                    )
+                result["loss"] = main_loss
+                result["loss_extra"] = loss_out[1:]
+
+        # Case C: loss_out 是 dict
+        elif isinstance(loss_out, dict):
+            if "loss" not in loss_out:
+                raise RuntimeError(
+                    f"loss_fn returned dict without 'loss' key: {loss_out.keys()}"
+                )
+            # Make sure the 'loss' value is a tensor
+            if not torch.is_tensor(loss_out['loss']):
+                raise RuntimeError(f"loss_fn returned dict, but 'loss' value is not a tensor ({type(loss_out['loss'])})")
+            result = loss_out.copy() # Use the dict directly
+
+        else:
+            raise RuntimeError(
+                f"Unsupported loss_out type from loss_fn: {type(loss_out)}"
+            )
+
+        # ---- 關鍵補強：確保 result['loss'] 是 0-dim scalar tensor ----
+        if "loss" not in result or not torch.is_tensor(result["loss"]):
+             # This should not happen if the logic above is correct, but added as a safeguard
+             raise RuntimeError(f"Robust parsing failed to produce a tensor for key 'loss'. Result: {result}, loss_out type: {type(loss_out)}")
+
+        main_loss = result["loss"]
+        if main_loss.dim() > 0:
+            # print(f"Warning: main_loss had dim > 0 ({main_loss.shape}), summing to scalar.") # Optional debug print
+            main_loss = main_loss.sum()
+
+        # 更新回 dict，確保 train loop 一定拿到 scalar tensor
+        result["loss"] = main_loss
+
+        # (可選) 確保其他 loss components 也是 scalar (如果存在)
+        for key in ["loss_box", "loss_cls", "loss_dfl", "loss_items"]:
+             if key in result and torch.is_tensor(result[key]) and result[key].dim() > 0:
+                 # Be careful summing 'loss_items' if it's not meant to be summed
+                 if key != 'loss_items':
+                     result[key] = result[key].sum()
+
+        return result
+
+    def forward_eval(self, batch_imgs: List[torch.Tensor]):
+        """
+        推論 / 驗證模式：
+        - 使用 Ultralytics 內建的推論 (model.eval() 時會自動做 decode + NMS)
+        - 把結果轉成 hooks.evaluate() 期待的格式
+        """
+
+        # batch_imgs: List[Tensor[C,H,W]] from dataloader.
+        # Ultralytics model 需要一個 4D tensor (B,C,H,W)，所以把它們疊起來
+        imgs = torch.stack(batch_imgs, dim=0)  # [B, C, H, W]
+
+        # （可選）把 conf / iou threshold 傳給底層 model，確保一致
+        # Ultralytics DetectionModel 支援 .conf / .iou / .max_det 這些屬性
+        if hasattr(self.model, "conf"):
+            self.model.conf = getattr(self, "conf_threshold", 0.25)
+        if hasattr(self.model, "iou"):
+            self.model.iou = getattr(self, "nms_iou", 0.45)
+        if hasattr(self.model, "max_det") and hasattr(self, "max_det"):
+            self.model.max_det = self.max_det
+
+        # 取得 Ultralytics 的推論結果
+        # 這裡 self.model 已經是 eval() 狀態，所以會回 list[Results]
+        ul_results = self.model(imgs)
+
+        # 轉成 evaluate() 需要的格式
+        batch_outputs = []
+        for res in ul_results:
+            # res.boxes is a Boxes object
+            boxes_xyxy = res.boxes.xyxy          # Tensor [N,4] on device
+            scores     = res.boxes.conf          # Tensor [N]
+            labels     = res.boxes.cls.to(torch.long)  # Tensor [N]
+
+            head_output = {
+                'boxes': boxes_xyxy,
+                'scores': scores,
+                'labels': labels,
+            }
+
+            # evaluate() 期望的是 List[List[dict]] per image
+            batch_outputs.append([head_output])
+
         return batch_outputs
-        
+
     def apply_logit_adjustment(self, preds):
         """ (Milestone TBD) Test-Time Logit Adjustment """
         # preds: List[Tensor[B, C, H, W], ...]

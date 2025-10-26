@@ -1,4 +1,3 @@
-# losses/yolo_loss.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,155 +5,115 @@ from typing import List, Optional
 
 try:
     from ultralytics.utils.tal import TaskAlignedAssigner, dist2bbox, make_anchors
-    from ultralytics.utils.ops import xyxy2xywhn, non_max_suppression
+    from ultralytics.utils import ops
     from ultralytics.nn.tasks import v8DetectionLoss
-    from ultralytics.utils.loss import BboxLoss
 except ImportError:
     raise ImportError("Please install 'ultralytics': pip install ultralytics")
 
-# 匯入我們自定義的 CB-Focal Loss
 from losses.cb_focal_loss import ClassBalancedFocalLoss
+
 
 class YOLOLongTailLoss(v8DetectionLoss):
     """
     繼承 YOLOv8 Loss，並客製化 Class Loss
-    
-    Milestone 1 (use_cb_loss=False):
-      - 完全等同於 v8DetectionLoss
-    
-    Milestone 2 (use_cb_loss=True):
-      - 將 self.bce (BCEWithLogitsLoss) 替換為 ClassBalancedFocalLoss
+    Milestone 1 (use_cb_loss=False): 同原版 YOLOv8
+    Milestone 2 (use_cb_loss=True): 使用 ClassBalancedFocalLoss
     """
-    
-    def __init__(self, 
-                 model, # YOLOv8 model (DetectionModel)
+
+    def __init__(self,
+                 model,
                  use_cb_loss: bool = False,
                  samples_per_cls: Optional[List[int]] = None,
                  cb_beta: float = 0.9999,
-                 focal_gamma: float = 2.0
-                 ):
-        
-        # 呼叫父類 (v8DetectionLoss) 的 init
-        # 它會自動設定 reg_max, dfl_loss, iou_loss (BboxLoss)
-        # 並且會設定 self.bce = nn.BCEWithLogitsLoss(reduction='none')
+                 focal_gamma: float = 2.0):
         super().__init__(model)
-        
+        self.model = model  # ✅ 關鍵修正：保存 model
         self.use_cb_loss = use_cb_loss
-        
-        # --- (Milestone 2+) 替換 Loss ---
+
         if self.use_cb_loss:
             if samples_per_cls is None:
                 raise ValueError("use_cb_loss=True, but samples_per_cls is not provided.")
-            
             print(f"[Loss] Using ClassBalancedFocalLoss (beta={cb_beta}, gamma={focal_gamma})")
-            
-            # 替換掉 v8DetectionLoss 預設的 BCE loss
-            # 我們自定義的 CB-Focal Loss 需要是 BCE-style (logits, targets)
-            self.bce = ClassBalancedFocalLoss(
-                samples_per_cls=samples_per_cls,
-                beta=cb_beta,
-                gamma=focal_gamma
-            )
+            self.bce = ClassBalancedFocalLoss(samples_per_cls=samples_per_cls,
+                                              beta=cb_beta, gamma=focal_gamma)
         else:
             print("[Loss] Using standard BCEWithLogitsLoss for classification.")
-            # 保持父類預設的 self.bce
-    
-    def decode_and_nms(self, preds, conf_thres, iou_thres):
-        """
-        Helper function: 將模型的 raw output 解碼並執行 NMS
-        (此功能在 v8DetectionLoss 中沒有，我們自己加，方便 evaluate)
-        
-        Args:
-            preds: (reg_preds, cls_preds) (來自 YOLODetector)
-            conf_thres: (float)
-            iou_thres: (float)
-        
-        Returns:
-            List[Tensor[N, 6]] (x1, y1, x2, y2, conf, cls_id)
-        """
-        
-        # reg_preds: List[Tensor[B, 64, H, W], ...]
-        # cls_preds: List[Tensor[B, NC, H, W], ...]
-        
-        # (來自 v8DetectionLoss.preprocess)
-        # 1. 將 (reg, cls) 合併
-        x = [] # list of [B, 64+NC, H, W]
-        for i in range(len(preds[0])):
-            x.append(torch.cat((preds[0][i], preds[1][i]), 1))
-        
-        # 2. 解碼 (來自 v8DetectionLoss.__call__)
-        box, cls = self.pred_decode(x)
-        # box: [B, Num_Anchors, 4] (xyxy)
-        # cls: [B, Num_Anchors, NC] (sigmoid)
-        
-        # 3. 執行 NMS (來自 ultralytics.utils.ops)
-        # NMS 需要 (boxes, scores)
-        # scores = cls.max(-1, keepdim=True)[0]
-        # boxes = (boxes * scores) # C_i = P(obj) * P(cls_i) - YOLOv5/v8
-        # ... 不對，v8 的 cls output 已經是 P(cls|obj) * P(obj)
-        
-        # ultralytics v8 NMS:
-        # box (xyxy) [B, N, 4]
-        # cls (sigmoid) [B, N, NC]
-        
-        B, N, NC = cls.shape
-        
-        # 建立 [B, N, 4 + NC]
-        pred_nms = torch.cat((box, cls), dim=2)
 
-        # 執行 NMS
-        # conf_thres 是 class confidence
-        # iou_thres 是 IoU
-        # multi_label=True (因為一張圖可能有多個同類物體)
-        results = non_max_suppression(
-            pred_nms,
-            conf_thres=conf_thres,
-            iou_thres=iou_thres,
-            multi_label=True
-        )
-        # results: List[Tensor[Num_Dets, 6]] (x1, y1, x2, y2, conf, cls_id)
+    def __call__(self, preds, batch):
+        """
+        最小且正確的補丁：
+        1) 確保 batch 內所有 tensor 在同一張 GPU (避免 gt 還在 CPU)
+        2) 把 self.stride 搬到同一張 GPU (避免 make_anchors() 產 CPU anchor_points)
+        3) 把 self.proj / self.assigner 等等也對齊到同一張 GPU
+        4) 然後呼叫父類的 super().__call__() 讓 Ultralytics 原本的 loss 流程跑完
+        """
+
+        # 用 preds 的裝置當作 ground truth，因為 preds 來自 model.forward() 後一定在正確的卡上
+        device = preds[0].device
+
+        # 1) 把 batch 中的資料 (gt_bboxes, gt_labels, imgsz...) 全部搬到同一張卡
+        for k, v in batch.items():
+            if torch.is_tensor(v):
+                batch[k] = v.to(device)
+            elif isinstance(v, (tuple, list)):
+                # 假如有 list of tensors，也一起搬；沒有就不影響
+                batch[k] = [x.to(device) if torch.is_tensor(x) else x for x in v]
+
+        # 2) 關鍵：把 stride 搬到 GPU
+        #    v8DetectionLoss 在 __init__ 時會把 model.stride 複製到 self.stride
+        #    但那一份是 CPU tensor；父類 __call__ 後面要用 self.stride 產 anchors
+        if hasattr(self, "stride") and torch.is_tensor(self.stride):
+            self.stride = self.stride.to(device)
+
+        # 3) 保險：把 proj (DFL用)、assigner (task-aligned assigner) 也搬到同一張卡
+        if hasattr(self, "proj") and torch.is_tensor(self.proj):
+            self.proj = self.proj.to(device)
+
+        # self.dfl 通常是 buffer/tensor用在 bbox decode，跟 proj 有關
+        if hasattr(self, "dfl") and torch.is_tensor(self.dfl):
+            self.dfl = self.dfl.to(device)
+
+        # assigner 是一個 nn.Module；理論上 model.to(device) 會帶著走
+        # 但如果 assigner 內有沒註冊成 buffer 的 tensor，我們手動 to() 一次最安全
+        if hasattr(self, "assigner"):
+            self.assigner = self.assigner.to(device)
+
+            # 一些 ultralytics 版本會在 assigner 裡面 cache grid_points 之類的東西
+            if hasattr(self.assigner, "grid_points"):
+                gp = self.assigner.grid_points
+                if torch.is_tensor(gp):
+                    self.assigner.grid_points = gp.to(device)
+
+        # 4) （可選除錯）你可以暫時印一下，之後確認沒問題就刪掉
+        # print("[DEBUG Loss.__call__]",
+        #       "stride:", self.stride.device if hasattr(self,"stride") and torch.is_tensor(self.stride) else "N/A",
+        #       "proj:",   self.proj.device   if hasattr(self,"proj")   and torch.is_tensor(self.proj)   else "N/A")
+
+        # 5) 交還給父類的 loss 計算邏輯
+        return super().__call__(preds, batch)
+
+    def decode_and_nms(self, preds, conf_thres, iou_thres):
+        """輔助函式：解碼 + NMS"""
+        x = [torch.cat((preds[0][i], preds[1][i]), 1) for i in range(len(preds[0]))]
+        box, cls = self.pred_decode(x)
+        B, N, NC = cls.shape
+        pred_nms = torch.cat((box, cls), dim=2)
+        results = ops.non_max_suppression(pred_nms, conf_thres=conf_thres,
+                                          iou_thres=iou_thres, multi_label=True)
         return results
-        
+
     def pred_decode(self, x):
-        """
-        Helper: 將 head output 解碼為 (box, cls)
-        (來自 v8DetectionLoss.__call__)
-        """
+        """輔助：從 head output 解碼"""
         device = x[0].device
-        # 確保 anchors/strides 在正確的 device
-        self.anchors, self.strides = (x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5))
+        self.anchors, self.strides = (y.transpose(0, 1) for y in make_anchors(x, self.stride.to(device), 0.5))
         self.anchors = self.anchors.to(device)
         self.strides = self.strides.to(device)
-        
         x_cat = torch.cat([i.view(x[0].shape[0], self.no, -1) for i in x], 2)
-        # x_cat: [B, 64(reg)+NC(cls), Num_Anchors_Total]
-        
-        # 解碼
         box, cls = x_cat.split((self.reg_max * 4, self.nc), 1)
-        
-        # 1. Box decode
-        a, b = box.chunk(2, 1)
-        a = self.project(a) # [B, 32, N]
-        b = self.project(b) # [B, 32, N]
-        # a/b shape: [B, 2 * reg_max, N]
-        
-        box = torch.cat((a, b), 1)
+        box = torch.cat((self.project(box[:, :self.reg_max*2]), self.project(box[:, self.reg_max*2:])), 1)
         box = box.transpose(1, 2).view(-1, 4, self.reg_max)
         box = F.softmax(box, dim=-1)
-        # box: [B*N, 4, 16] (reg_max=16)
-        
-        # DFL
-        box = box @ self.dfl
+        box = box @ self.dfl.to(device)
         box = dist2bbox(box, self.anchors.unsqueeze(0), xywh=False, dim=1)
-        # box: [B, N, 4] (xyxy)
-        
-        # 2. Class decode
-        cls = cls.transpose(1, 2) # [B, N, NC]
-        cls = cls.sigmoid()
-        
+        cls = cls.transpose(1, 2).sigmoid()
         return box, cls
-
-
-    # __call__ 方法會自動繼承
-    # 它會使用 self.bce (我們在 init 中替換的)
-    # 所以 Milestone 2 會自動啟用 CB-Focal Loss

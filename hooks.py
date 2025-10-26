@@ -40,10 +40,13 @@ def build_model(cfg: Dict[str, Any]) -> nn.Module:
         print("Using yolov8n.yaml instead.")
         model_name = "yolov8n.yaml"
 
+    loss_hpy = cfg.get('loss_hpy', {}) # 獲取 loss_hpy 字典
+
     model = YOLODetector(
         model_name=model_name,
         num_classes=cfg.get('num_classes', 4),
-        
+        loss_hpy=cfg.get('loss_hpy', {}),   # <-- 將 loss 超參數傳入
+
         # Long-Tail 相關參數 (Milestone 2+)
         use_cb_loss=cfg.get('use_cb_loss', False),
         samples_per_cls=cfg.get('samples_per_cls'),

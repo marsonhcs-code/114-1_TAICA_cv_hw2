@@ -206,7 +206,9 @@ def train_one_epoch(model, loader, optimizer, device, scaler=None,
         optimizer.zero_grad(set_to_none=True)
 
         if scaler is not None:
-            with torch.cuda.amp.autocast(True):
+            # with torch.cuda.amp.autocast(True):
+            # 【修改】: 使用新的 torch.amp.autocast 語法
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                 out = model(images, targets) if targets is not None else model(images)
                 loss = out["loss"] if isinstance(out, dict) and "loss" in out else out
             scaler.scale(loss / accum_steps).backward()
@@ -245,6 +247,24 @@ def run_once(args, cfg, device, dist_enabled=False, fold_split=None) -> Dict[str
 
     # ----- 建模 / 優化器 / AMP / Scheduler / Resume -----
     model = build_model(cfg).to(device)
+    # 1. Fix the `stride` tensor (The direct cause of the current error)
+    #    Use the reliable overwrite method with the stride from the GPU model
+    model.loss_fn.stride = model.model.stride
+
+    # 2. Fix the `proj` tensor (Used in bbox_decode, caused previous errors)
+    model.loss_fn.proj = model.loss_fn.proj.to(device)
+
+    # 3. Fix the `assigner` module (Used for target assignment, caused previous errors)
+    model.loss_fn.assigner = model.loss_fn.assigner.to(device)
+
+    # 4. (Optional but recommended) Ensure loss_fn knows the correct device
+    model.loss_fn.device = device
+    # 【!!! Add Fixes END !!!】
+    if hasattr(model, "loss_fn") and hasattr(model.loss_fn, "proj"):
+        model.loss_fn.proj = model.loss_fn.proj.to(device)
+    
+    
+    print(f"[DEBUG] proj device: {model.loss_fn.proj.device}")
     if args.compile and hasattr(torch, "compile"):
         model = torch.compile(model)
 

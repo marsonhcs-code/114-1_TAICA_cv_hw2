@@ -4,7 +4,7 @@ task: "detection"
 
 # Data
 image_dir: "data/CVPDL_hw2/train"
-test_image_dir: "data/CVPDL_hw2/test"
+# test_image_dir: "data/CVPDL_hw2/test"
 imgsz: 640
 batch: 10
 workers: 8
@@ -24,6 +24,13 @@ class_names: ["car", "motorcycle", "person", "hov"]
 lr: 0.001
 weight_decay: 0.0001
 optimizer: "AdamW"
+
+# Loss Hyperparameters (for v8DetectionLoss)
+loss_hpy:
+  box: 7.5      # box loss gain
+  cls: 0.5      # cls loss gain
+  dfl: 1.5      # dfl loss gain
+  iou_type: 'ciou'  # (ciou, giou, diou)
 
 # Long-tail (DISABLED for baseline)
 use_cb_loss: false

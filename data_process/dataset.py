@@ -190,8 +190,15 @@ class DroneTrafficDataset(Dataset):
         # --- 5. 轉換為 Tensors ---
         img_tensor = torch.from_numpy(img_padded).permute(2, 0, 1).float() / 255.0
         
-        boxes_tensor = torch.tensor(boxes, dtype=torch.float32) if boxes else torch.zeros((0, 4))
-        labels_tensor = torch.tensor(labels, dtype=torch.long) if labels else torch.zeros((0,), dtype=torch.long)
+        # boxes_tensor = torch.tensor(boxes, dtype=torch.float32) if boxes else torch.zeros((0, 4))
+        # labels_tensor = torch.tensor(labels, dtype=torch.long) if labels else torch.zeros((0,), dtype=torch.long)
+        
+        # 【修改】: 先轉為單一 numpy array 再轉 tensor
+        boxes_np = np.array(boxes) if boxes else np.zeros((0, 4))
+        boxes_tensor = torch.tensor(boxes_np, dtype=torch.float32)
+
+        labels_np = np.array(labels) if labels else np.zeros((0,))
+        labels_tensor = torch.tensor(labels_np, dtype=torch.long) 
         
         target = {
             'boxes': boxes_tensor,
