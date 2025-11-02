@@ -22,6 +22,43 @@ from hooks import build_model, build_dataloaders, evaluate
 
 # ======================= 直接在這裡改參數 =======================
 # train.py - CONFIG 設定
+# train.py - Baseline Stability Check CONFIG
+CONFIG = dict(
+    # 基本
+    cfg="configs/baseline_stability_check.yaml",
+    out="runs/baseline_stability_check",
+    model_name="yolo_stability",
+    epochs=30,  # 只跑 30 epochs 做快速驗證
+    seed=42,
+    note="Baseline Stability Check: 30 epochs to verify training pipeline",
+
+    # 訓練
+    amp=True,
+    compile=False,
+    accum=4,
+    grad_clip=10.0,
+
+    # DDP
+    dist=False,
+    find_unused_parameters=False,
+
+    # 評估
+    best_metric="map5095",
+    eval_test_each_epoch=False,
+
+    # Resume
+    resume=None,
+
+    # Early Stopping（寬鬆設定）
+    early_stop_patience=15,
+
+    # Scheduler
+    scheduler="cos",
+
+    # K-Fold
+    kfold=0,
+    save_splits=False,
+)
 """
 實驗 1: Baseline (no long-tail handling)
 --------
@@ -30,43 +67,43 @@ from hooks import build_model, build_dataloaders, evaluate
 - Car AP: ~80% (good)
 - HOV AP: ~25% (poor) ← 這是我們要改善的
 """
-CONFIG = dict(
-    # 基本
-    cfg="configs/exp_baseline.yaml",  # <-- 指向 baseline config
-    out="runs/exp1_baseline",
-    model_name="yolo_baseline", # 這是 log 用的
-    epochs=100, 
-    seed=42,
-    note="Baseline: YOLOv8n from scratch without long-tail handling", #
+# CONFIG = dict(
+#     # 基本
+#     cfg="configs/exp_baseline.yaml",  # <-- 指向 baseline config
+#     out="runs/exp1_baseline",
+#     model_name="yolo_baseline", # 這是 log 用的
+#     epochs=100, 
+#     seed=42,
+#     note="Baseline: YOLOv8n from scratch without long-tail handling", #
 
-    # 訓練
-    amp=True,
-    compile=False,
-    accum=4,  
-    grad_clip=10.0,
+#     # 訓練
+#     amp=True,
+#     compile=False,
+#     accum=4,  
+#     grad_clip=10.0,
 
-    # DDP
-    dist=False,
-    find_unused_parameters=False,
+#     # DDP
+#     dist=False,
+#     find_unused_parameters=False,
 
-    # 評估
-    best_metric="map5095", #
-    eval_test_each_epoch=False,
+#     # 評估
+#     best_metric="map5095", #
+#     eval_test_each_epoch=False,
 
-    # Resume
-    resume=None,
+#     # Resume
+#     resume=None,
 
-    # Early Stopping
-    early_stop_patience=20,
+#     # Early Stopping
+#     early_stop_patience=20,
 
-    # Scheduler
-    scheduler="cos",
+#     # Scheduler
+#     scheduler="cos",
 
-    # K-Fold
-    kfold=0, # 0 = 不使用 k-fold
-    save_splits=False,
-)
-# ========== 推薦的訓練流程 ==========
+#     # K-Fold
+#     kfold=0, # 0 = 不使用 k-fold
+#     save_splits=False,
+# )
+# # ========== 推薦的訓練流程 ==========
 """
 實驗 2: CB-Focal Loss
 ----------------------

@@ -7,31 +7,35 @@ from ultralytics import YOLO
 
 # ================== 推論設定 (可調參) ==================
 
-PROJ_ROOT = Path(__file__).resolve().parents[0]
+PROJ_ROOT = Path(__file__).resolve().parents[1]
 
 TEST_IMG_DIR = PROJ_ROOT / "data" / "CVPDL_hw2" / "test"
 
 WEIGHTS = PROJ_ROOT / "runs_yolo_baseline" / "yolov10m_12g_highres" / "weights" / "best.pt"
 
-OUT_CSV = PROJ_ROOT / "results" / "submission_pureYOLO_limit_1536_0.03confThr.csv"
+OUT_CSV = PROJ_ROOT / "results" / "submission_pureYOLO_limit_1536_0.000001confThr.csv"
 
 SAMPLE_SUB_PATH = PROJ_ROOT / "data" / "sample_submission2.csv"
 USE_SAMPLE_ORDER = SAMPLE_SUB_PATH.exists()
 
-CONF_THR = 0.03
-IOU_THR  = 0.65
+CONF_THR = 0.000001
+IOU_THR  = 0.5
 MAX_DETS = 3000
 
 KEEP_LEADING_ZEROS_ID = False
 
 CONF_DECIMALS = 6
 POS_DECIMALS  = 2
+CLASS_COLORS = {
+    0: (0, 255, 0),      # 綠色
+    1: (255, 0, 0),      # 藍色
+    2: (0, 0, 255),      # 紅色
+    3: (255, 255, 0),    # 淺藍
+}
+CLASS_NAMES = {0: "car", 1: "hov", 2: "p", 3: "m"}
+SAVE_DEBUG_DIR = Path("debug_selected_imgs/single")      # 存放畫框結果
 
-CLASS_ID_OUT = 0
-
-SAVE_DEBUG_DIR = None  # or Path("debug_infer_vis")
-
-INFER_IMGSZ_STRATEGY = 2048  # "max_side"  # or int like 1024
+INFER_IMGSZ_STRATEGY = 1536  # "max_side"  # or int like 1024
 
 # ======================================================
 
@@ -85,25 +89,36 @@ def _decide_imgsz(H, W):
     return max(H, W)
 
 
-def _draw_boxes_debug(img_bgr, det_xyxy, det_conf, out_path):
+def _draw_boxes_debug(img_bgr, det_xyxy, det_conf, det_cls, out_path):
+    """
+    在圖片上畫出偵測框（不同類別不同顏色）
+    img_bgr: BGR 影像
+    det_xyxy: [N, 4]
+    det_conf: [N]
+    det_cls: [N]
+    out_path: 輸出路徑
+    """
     vis = img_bgr.copy()
-    for (x1, y1, x2, y2), cf in zip(det_xyxy, det_conf):
+    for (x1, y1, x2, y2), cf, cid in zip(det_xyxy, det_conf, det_cls):
+        color = CLASS_COLORS.get(int(cid), (200, 200, 200))
+        label = f"{CLASS_NAMES.get(int(cid), 'cls'+str(int(cid)))} {cf:.2f}"
+
         x1i, y1i, x2i, y2i = map(int, [x1, y1, x2, y2])
-        cv2.rectangle(vis, (x1i, y1i), (x2i, y2i), (0, 255, 0), 2)
+        cv2.rectangle(vis, (x1i, y1i), (x2i, y2i), color, 2)
         cv2.putText(
-            vis,
-            f"{cf:.2f}",
-            (x1i, max(y1i - 5, 0)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 255, 0),
-            1,
-            cv2.LINE_AA,
+            vis, label, (x1i, max(y1i - 5, 0)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA
         )
+    # 尺寸對齊
+    h1, w1 = img_bgr.shape[:2]
+    h2, w2 = vis.shape[:2]
+    if h1 != h2:
+        vis = cv2.resize(vis, (w1, h1))
+    combined = np.hstack([img_bgr, vis])
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(out_path), vis)
-
-
+    cv2.imwrite(str(out_path), combined)
+  
 def main():
     OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
     if SAVE_DEBUG_DIR is not None:
@@ -171,7 +186,7 @@ def main():
             iou=IOU_THR,
             max_det=MAX_DETS,
             agnostic_nms=True,
-            verbose=False
+            verbose=False,
         )
 
         parts = []
@@ -205,8 +220,6 @@ def main():
 
                     # class 輸出
                     out_cls = int(cls_id)
-                    # 如果 leaderboard 強制一個 class:
-                    # out_cls = int(CLASS_ID_OUT)
 
                     parts.extend([
                         f"{float(c):.{CONF_DECIMALS}f}",
@@ -217,11 +230,14 @@ def main():
                         str(out_cls),
                     ])
 
+                # optional debug可視化
                 if SAVE_DEBUG_DIR is not None and len(xyxy) > 0:
+                    kept_cls = cls_arr[:len(xyxy)]  # 取出對應的 class id
                     _draw_boxes_debug(
                         img_bgr,
                         xyxy,
                         conf,
+                        kept_cls,
                         SAVE_DEBUG_DIR / f"{image_id}.jpg"
                     )
 
